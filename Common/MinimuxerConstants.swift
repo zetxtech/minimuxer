@@ -51,8 +51,21 @@ public enum MinimuxerConstants {
     public static let usbmuxMaxPacketBufferLength = 4095
     public static let usbmuxHeaderLen = 16
 
-    // Sleep timeouts
+    // Heartbeat keep-alive
     public static let heartbeatInterval: UInt64 = 1000
+    public static let heartbeatSleepNs: UInt64 = 1_000_000_000
+    public static let heartbeatInitialReceiveTimeoutSeconds: UInt64 = 15
+    public static let heartbeatReceiveTimeoutMarginSeconds: UInt64 = 5
+    public static let heartbeatMaxReceiveTimeoutSeconds: UInt64 = 60
+
+    /// Receive deadline for a device driven heartbeat: requested interval plus margin, capped.
+    public static func heartbeatReceiveTimeoutSeconds(forRequestedInterval requestedInterval: UInt64) -> UInt64 {
+        let (withMargin, overflow) = requestedInterval.addingReportingOverflow(heartbeatReceiveTimeoutMarginSeconds)
+        if overflow {
+            return heartbeatMaxReceiveTimeoutSeconds
+        }
+        return min(withMargin, heartbeatMaxReceiveTimeoutSeconds)
+    }
 
     // Packet Configuration
     public static let maxPacketSize = 1024

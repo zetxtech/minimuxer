@@ -308,7 +308,10 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             // start our fake usbmuxd server for clients if required
             try await restartMuxerServer()
         }
-        
+
+        // start the heartbeat keep-alive so the device does not tear down our service connections
+        self.heartbeat.start()
+
         // mark ready!
         await state.with{
             $0.status = .started
@@ -316,6 +319,9 @@ final internal class MinimuxerImpl: MinimuxerAPI {
     }
 
     func stop() async throws(MinimuxerError) {
+        // stop the heartbeat keep-alive first
+        self.heartbeat.stop()
+
         // actor serialization scope
         let oldTask = await state.with { state -> Task<Bool, Error>? in
             state.status = .inprogress  // mark inprogress

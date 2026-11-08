@@ -715,26 +715,59 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         }
     }
 
+    private func isConnectionDropError(_ error: Error) -> Bool {
+        let message = String(describing: error).lowercased()
+        let markers = [
+            "unexpectedeof",
+            "unexpected eof",
+            "connectionreset",
+            "connection reset",
+            "brokenpipe",
+            "broken pipe",
+            "connectionaborted",
+            "connection aborted",
+            "channel closed"
+        ]
+        return markers.contains { message.contains($0) }
+    }
+
+    // Runs `body` once and retries it a single time when the device dropped the
+    // service connection mid-operation (these operations are idempotent)
+    private func performWithConnectionDropRetry<T>(_ operation: String, _ body: () throws -> T) throws -> T {
+        do {
+            return try body()
+        } catch {
+            guard isConnectionDropError(error) else {
+                throw error
+            }
+            debugLog("[IdeviceGateway] \(operation) hit a dropped connection; invalidating and retrying once")
+            invalidateConnection()
+            return try body()
+        }
+    }
+
     private func syncInstallProvisioningProfile(profile: Data) throws {
         debugLog("[IdeviceGateway] installProvisioningProfile() called, profile length: \(profile.count)")
         try verifyInitialized()
-        try performWithEitherService(
-            connectRP: misagent_connect_rsd,
-            connectLockdown: misagent_connect,
-            cleanup: misagent_client_free,
-            serviceName: "misagent"
-        ) { client in
-            try profile.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-                if let baseAddress = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) {
-                    verboseLog("[IdeviceGateway] installProvisioningProfile() calling misagent_install")
-                    let installErr = misagent_install(client, baseAddress, profile.count)
-                    if let installErr = installErr {
-                        let msg = self.getErrorMessage(from: installErr)
-                        debugLog("[IdeviceGateway] installProvisioningProfile() misagent_install failed: \(msg)")
-                        defer { safeFreeError(installErr) }
-                        throw IdeviceGatewayError(.serviceError, reason: "Failed to install profile, error: (\(msg))")
+        try performWithConnectionDropRetry("installProvisioningProfile") {
+            try self.performWithEitherService(
+                connectRP: misagent_connect_rsd,
+                connectLockdown: misagent_connect,
+                cleanup: misagent_client_free,
+                serviceName: "misagent"
+            ) { client in
+                try profile.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+                    if let baseAddress = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                        verboseLog("[IdeviceGateway] installProvisioningProfile() calling misagent_install")
+                        let installErr = misagent_install(client, baseAddress, profile.count)
+                        if let installErr = installErr {
+                            let msg = self.getErrorMessage(from: installErr)
+                            debugLog("[IdeviceGateway] installProvisioningProfile() misagent_install failed: \(msg)")
+                            defer { safeFreeError(installErr) }
+                            throw IdeviceGatewayError(.serviceError, reason: "Failed to install profile, error: (\(msg))")
+                        }
+                        debugLog("[IdeviceGateway] installProvisioningProfile() misagent_install succeeded")
                     }
-                    debugLog("[IdeviceGateway] installProvisioningProfile() misagent_install succeeded")
                 }
             }
         }
@@ -743,22 +776,24 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     private func syncRemoveProvisioningProfile(id: String) throws {
         debugLog("[IdeviceGateway] removeProvisioningProfile() called, id: \(id)")
         try verifyInitialized()
-        try performWithEitherService(
-            connectRP: misagent_connect_rsd,
-            connectLockdown: misagent_connect,
-            cleanup: misagent_client_free,
-            serviceName: "misagent"
-        ) { client in
-            try id.withCString { idPtr in
-                verboseLog("[IdeviceGateway] removeProvisioningProfile() calling misagent_remove")
-                let removeErr = misagent_remove(client, idPtr)
-                if let removeErr = removeErr {
-                    let msg = self.getErrorMessage(from: removeErr)
-                    debugLog("[IdeviceGateway] removeProvisioningProfile() misagent_remove failed: \(msg)")
-                    defer { safeFreeError(removeErr) }
-                    throw IdeviceGatewayError(.serviceError, reason: "Failed to remove profile, error: (\(msg))")
+        try performWithConnectionDropRetry("removeProvisioningProfile") {
+            try self.performWithEitherService(
+                connectRP: misagent_connect_rsd,
+                connectLockdown: misagent_connect,
+                cleanup: misagent_client_free,
+                serviceName: "misagent"
+            ) { client in
+                try id.withCString { idPtr in
+                    verboseLog("[IdeviceGateway] removeProvisioningProfile() calling misagent_remove")
+                    let removeErr = misagent_remove(client, idPtr)
+                    if let removeErr = removeErr {
+                        let msg = self.getErrorMessage(from: removeErr)
+                        debugLog("[IdeviceGateway] removeProvisioningProfile() misagent_remove failed: \(msg)")
+                        defer { safeFreeError(removeErr) }
+                        throw IdeviceGatewayError(.serviceError, reason: "Failed to remove profile, error: (\(msg))")
+                    }
+                    debugLog("[IdeviceGateway] removeProvisioningProfile() misagent_remove succeeded")
                 }
-                debugLog("[IdeviceGateway] removeProvisioningProfile() misagent_remove succeeded")
             }
         }
     }
@@ -1369,6 +1404,54 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
            }
            debugLog("[IdeviceGateway] performHeartbeat() succeeded, newInterval: \(newInterval.pointee)")
        }
+    }
+
+    private static let heartbeatSessionQueue = DispatchQueue(label: "net.minimuxer.heartbeat-session", qos: .utility)
+
+    // Keep a single heartbeat service connection alive, exchanging Marco/Polo pairs until
+    // `shouldContinue` returns false. iOS keeps other service sessions alive while a
+    // heartbeat client is connected and responding.
+    private func syncPerformHeartbeatSession(
+        interval: UInt64,
+        shouldContinue: @escaping @Sendable () -> Bool,
+        onBeat: @escaping @Sendable (UInt64) -> Void
+    ) throws {
+        debugLog("[IdeviceGateway] performHeartbeatSession() started, interval: \(interval)")
+        try verifyInitialized()
+        try performWithEitherService(
+            connectRP: heartbeat_connect_rsd,
+            connectLockdown: heartbeat_connect,
+            cleanup: heartbeat_client_free,
+            serviceName: "heartbeat"
+        ) { client in
+            var receiveTimeout = interval > 0
+                ? interval
+                : MinimuxerConstants.heartbeatInitialReceiveTimeoutSeconds
+
+            while shouldContinue() {
+                var newInterval: UInt64 = 0
+                verboseLog("[IdeviceGateway] performHeartbeatSession() waiting for marco, timeout: \(receiveTimeout)")
+                let getErr = heartbeat_get_marco(client, receiveTimeout, &newInterval)
+                if let getErr = getErr {
+                    let msg = self.getErrorMessage(from: getErr)
+                    debugLog("[IdeviceGateway] performHeartbeatSession() heartbeat_get_marco failed: \(msg)")
+                    defer { safeFreeError(getErr) }
+                    throw IdeviceGatewayError(.serviceError, reason: "Heartbeat receive failed, error: (\(msg))")
+                }
+                if newInterval > 0 {
+                    receiveTimeout = MinimuxerConstants.heartbeatReceiveTimeoutSeconds(forRequestedInterval: newInterval)
+                }
+                let sendErr = heartbeat_send_polo(client)
+                if let sendErr = sendErr {
+                    let msg = self.getErrorMessage(from: sendErr)
+                    debugLog("[IdeviceGateway] performHeartbeatSession() heartbeat_send_polo failed: \(msg)")
+                    defer { safeFreeError(sendErr) }
+                    throw IdeviceGatewayError(.serviceError, reason: "Heartbeat send failed, error: (\(msg))")
+                }
+                onBeat(newInterval)
+            }
+            verboseLog("[IdeviceGateway] performHeartbeatSession() ended")
+        }
     }
 
     private func syncMountPersonalizedDdi(image: Data, trustcache: Data, manifest: Data) throws {
@@ -2376,6 +2459,20 @@ extension IdeviceGateway {
             var newInterval: UInt64 = 0
             try self.syncPerformHeartbeat(interval: interval, newInterval: &newInterval)
             return newInterval > 0 ? newInterval : 1000
+        }
+    }
+
+    public func performHeartbeatSession(
+        interval: UInt64,
+        shouldContinue: @escaping @Sendable () -> Bool,
+        onBeat: @escaping @Sendable (UInt64) -> Void
+    ) async throws {
+        try await withFFIDispatch(on: IdeviceGateway.heartbeatSessionQueue) {
+            try self.syncPerformHeartbeatSession(
+                interval: interval,
+                shouldContinue: shouldContinue,
+                onBeat: onBeat
+            )
         }
     }
 

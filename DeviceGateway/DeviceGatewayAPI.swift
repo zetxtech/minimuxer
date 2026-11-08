@@ -59,6 +59,14 @@ public protocol DeviceGatewayAPI: AnyObject, Sendable {
 
     func performHeartbeat(interval: UInt64) async throws -> UInt64
 
+    /// Keep a heartbeat session running until `shouldContinue` returns false.
+    /// Implementations should hold a persistent heartbeat connection when possible.
+    func performHeartbeatSession(
+        interval: UInt64,
+        shouldContinue: @escaping @Sendable () -> Bool,
+        onBeat: @escaping @Sendable (UInt64) -> Void
+    ) async throws
+
     func startWirelessPair(
         hostName: String,
         hostModel: String,
@@ -91,5 +99,22 @@ public extension DeviceGatewayAPI {
     // Active service port for the currently loaded pairing file mode
     var servicePort: UInt16 {
         getPort(for: pairingFileType)
+    }
+
+    // Default heartbeat session for gateways without persistent-session support:
+    // loops one-shot heartbeat exchanges until asked to stop.
+    func performHeartbeatSession(
+        interval: UInt64,
+        shouldContinue: @escaping @Sendable () -> Bool,
+        onBeat: @escaping @Sendable (UInt64) -> Void
+    ) async throws {
+        var currentInterval = interval
+        while shouldContinue() {
+            let newInterval = try await performHeartbeat(interval: currentInterval)
+            if newInterval > 0 {
+                currentInterval = newInterval
+            }
+            onBeat(newInterval)
+        }
     }
 }

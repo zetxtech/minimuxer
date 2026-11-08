@@ -10,7 +10,7 @@ import Foundation
 internal import MinimuxerCommon
 internal import DeviceGatewayAPI
 
-final internal class HeartbeatService {
+final internal class HeartbeatService: @unchecked Sendable {
     let deviceProvider: DeviceProvider
     var gateway: any DeviceGatewayAPI {
         deviceProvider.gateway
@@ -18,46 +18,35 @@ final internal class HeartbeatService {
     let proxyServer: UsbmuxdProxyServer
     let endpoint: DeviceEndpoint
 
-    private let sleepNs: UInt64 = MinimuxerConstants.heartbeatInterval * 1_000_000
+    private let sleepNs: UInt64 = MinimuxerConstants.heartbeatSleepNs
+
+    private let lock = NSLock()
+    private var running = false
+    private var taskActive = false
+    private var lastErrorDescription: String?
+    private var lastBeatSuccessfulStorage = false
 
     init(deviceProvider: DeviceProvider, proxyServer: UsbmuxdProxyServer, endpoint: DeviceEndpoint) {
         self.deviceProvider = deviceProvider
         self.proxyServer = proxyServer
         self.endpoint = endpoint
     }
-    
-    private actor MutableState {
-        var running = false
-        var taskActive = false
 
-        func tryStart() -> Bool {
+    var lastBeatSuccessful: Bool {
+        lock.withLock { lastBeatSuccessfulStorage }
+    }
+
+    // Start the heartbeat keep-alive loop. Safe to call multiple times — ignored while a task is already active.
+    func start() {
+        let shouldLaunch = lock.withLock { () -> Bool in
+            running = true
             if taskActive {
-                running = true
                 return false
             }
-            running = true
             taskActive = true
             return true
         }
-
-        func stop() {
-            running = false
-        }
-
-        func terminate() {
-            taskActive = false
-            running = false
-        }
-    }
-
-    private let state = MutableState()
-    private var lastErrorDescription: String?
-
-    var lastBeatSuccessful = false
-
-    // Start the heartbeat loop. ignored if a task is already active.
-    func start() async {
-        guard await state.tryStart() else {
+        guard shouldLaunch else {
             return
         }
 
@@ -68,70 +57,106 @@ final internal class HeartbeatService {
 
             await self.heartbeatLoop()
 
-            await self.state.terminate()
-            self.lastBeatSuccessful = false
+            let shouldRelaunch = self.lock.withLock { () -> Bool in
+                self.taskActive = false
+                return self.running
+            }
+            self.setLastBeat(false)
             verboseLog("[minimuxer] heartbeat-task: stopped")
+            if shouldRelaunch {
+                self.start()
+            }
         }
     }
 
-    // Signal the heartbeat task to stop. will exit on next iteration.
-    func stop() async {
-        await state.stop()
-        lastBeatSuccessful = false
+    // Signal the heartbeat task to stop. The task exits after its current exchange.
+    func stop() {
+        lock.withLock { running = false }
+        setLastBeat(false)
         verboseLog("[minimuxer] HeartbeatService stop requested")
     }
 
+    private var isRunning: Bool {
+        lock.withLock { running }
+    }
+
+    private func setLastBeat(_ value: Bool) {
+        lock.withLock { lastBeatSuccessfulStorage = value }
+    }
+
+    private func clearLastError() {
+        lock.withLock { lastErrorDescription = nil }
+    }
+
     private func logIfNeeded(_ message: String, isVerbose: Bool = false) {
-        if message != lastErrorDescription {
-            if isVerbose {
-                verboseLog("[minimuxer] heartbeat-task: \(message)")
-            } else {
-                debugLog("[minimuxer] heartbeat-task: \(message)")
+        let shouldLog = lock.withLock { () -> Bool in
+            if message == lastErrorDescription {
+                return false
             }
             lastErrorDescription = message
+            return true
+        }
+        guard shouldLog else { return }
+        if isVerbose {
+            verboseLog("[minimuxer] heartbeat-task: \(message)")
+        } else {
+            debugLog("[minimuxer] heartbeat-task: \(message)")
         }
     }
 
     private func heartbeatLoop() async {
         if self.gateway.requiresUsbmuxd {
-            while !self.proxyServer.isListening {
+            while isRunning && !self.proxyServer.isListening {
                 logIfNeeded("Waiting for usbmuxd to be ready...", isVerbose: true)
                 try? await Task.sleep(nanoseconds: sleepNs)
             }
-            verboseLog("[minimuxer] heartbeat-task: usbmuxd is ready")
+            if isRunning {
+                verboseLog("[minimuxer] heartbeat-task: usbmuxd is ready")
+            }
         }
 
-        var currentInterval: UInt64 = MinimuxerConstants.heartbeatInterval
-
-        while await state.running {
+        while isRunning {
             let tunnelPeerIp: String
             do {
                 tunnelPeerIp = try await self.endpoint.ip()
             } catch {
                 logIfNeeded("device IP unavailable", isVerbose: true)
-                lastBeatSuccessful = false
+                setLastBeat(false)
                 try? await Task.sleep(nanoseconds: sleepNs)
                 continue
             }
-            
+
             // verify tunnel/device reachability first
             let targetPort = self.gateway.servicePort
             if !NetworkUtils.testTCP(ip: tunnelPeerIp, port: targetPort) {
                 logIfNeeded("device IP not reachable, waiting...", isVerbose: true)
-                lastBeatSuccessful = false
+                setLastBeat(false)
                 try? await Task.sleep(nanoseconds: sleepNs)
                 continue
             }
 
             do {
-                currentInterval = try await self.gateway.performHeartbeat(interval: currentInterval)
-                lastBeatSuccessful = true
-                lastErrorDescription = nil
+                // The session holds one heartbeat connection open and only returns
+                // once the device drops it or `shouldContinue` turns false.
+                try await self.gateway.performHeartbeatSession(
+                    interval: MinimuxerConstants.heartbeatInitialReceiveTimeoutSeconds,
+                    shouldContinue: { [weak self] in
+                        self?.isRunning ?? false
+                    },
+                    onBeat: { [weak self] interval in
+                        guard let self = self else { return }
+                        self.clearLastError()
+                        self.setLastBeat(true)
+                        verboseLog("[minimuxer] heartbeat-task: marco received, polo sent, nextInterval=\(interval)")
+                    }
+                )
             } catch {
                 logIfNeeded("Heartbeat failed: \(error)")
-                lastBeatSuccessful = false
+                setLastBeat(false)
                 try? await Task.sleep(nanoseconds: sleepNs)
             }
         }
+
+        setLastBeat(false)
     }
 }
